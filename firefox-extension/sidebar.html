@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Browser Agent</title>
+  <style>
+    :root {
+      --bg: #0a0a0b;
+      --surface: #111113;
+      --surface-2: #161619;
+      --border: rgba(255, 255, 255, 0.08);
+      --border-strong: rgba(255, 255, 255, 0.16);
+      --text: #f4f4f5;
+      --text-muted: #a1a1aa;
+      --text-dim: #71717a;
+      --accent: #f4f4f5;
+      --accent-text: #09090b;
+      --ok: #10b981;
+      --warn: #f59e0b;
+      --err: #ef4444;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      width: 100%;
+      height: 100vh;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      font-size: 12.5px;
+      line-height: 1.5;
+      display: flex;
+      flex-direction: column;
+      user-select: text;
+      -moz-user-select: text;
+      -webkit-user-select: text;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* Header */
+    .header {
+      height: 44px;
+      padding: 0 14px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+      gap: 10px;
+    }
+
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .brand-title {
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--text);
+      white-space: nowrap;
+    }
+
+    .sep {
+      color: var(--text-dim);
+    }
+
+    .status-text {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11.5px;
+      color: var(--text-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .status-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--text-dim);
+      flex-shrink: 0;
+    }
+    .status-dot.online { background: var(--ok); }
+    .status-dot.offline { background: var(--warn); }
+    .status-dot.working {
+      background: var(--text);
+      animation: pulse 1.2s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.35; }
+    }
+
+    .header-controls {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    .ctrl-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 9px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 500;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--text-muted);
+      transition: background 0.15s, color 0.15s, border-color 0.15s;
+      white-space: nowrap;
+    }
+    .ctrl-btn:hover {
+      background: rgba(255, 255, 255, 0.09);
+      color: var(--text);
+    }
+
+    .ctrl-btn.primary {
+      background: var(--accent);
+      color: var(--accent-text);
+      border-color: var(--accent);
+    }
+    .ctrl-btn.primary:hover {
+      background: #ffffff;
+    }
+
+    .ctrl-btn.danger:hover {
+      color: #fca5a5;
+      border-color: rgba(239, 68, 68, 0.35);
+      background: rgba(239, 68, 68, 0.1);
+    }
+
+    .icon-btn {
+      padding: 5px;
+      border-radius: 6px;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--text-muted);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.15s, color 0.15s;
+    }
+    .icon-btn:hover {
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--text);
+    }
+
+    /* Settings Drawer */
+    .settings-panel {
+      display: none;
+      background: var(--surface-2);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 14px;
+      flex-direction: column;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    .settings-panel.open {
+      display: flex;
+    }
+
+    .settings-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .settings-input-group {
+      display: flex;
+      gap: 6px;
+    }
+
+    .settings-input {
+      flex: 1;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      color: var(--text);
+      padding: 6px 10px;
+      font-size: 11.5px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      outline: none;
+    }
+    .settings-input:focus {
+      border-color: var(--border-strong);
+    }
+
+    .btn-save-cfg {
+      padding: 6px 12px;
+      background: var(--accent);
+      color: var(--accent-text);
+      border: none;
+      border-radius: 7px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .btn-save-cfg:hover {
+      background: #ffffff;
+    }
+
+    .btn-link-muted {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      font-size: 11px;
+      cursor: pointer;
+      text-align: left;
+      padding: 0;
+    }
+    .btn-link-muted:hover {
+      color: var(--text);
+      text-decoration: underline;
+    }
+
+    /* Active Task Bar */
+    .task-card {
+      display: none;
+      background: var(--surface-2);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 14px;
+      flex-shrink: 0;
+    }
+
+    .task-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .task-title {
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .task-steps {
+      font-size: 11px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-variant-numeric: tabular-nums;
+      color: var(--text-muted);
+      flex-shrink: 0;
+    }
+
+    .approach-btn {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      cursor: pointer;
+      padding: 2px;
+      display: inline-flex;
+      align-items: center;
+    }
+    .approach-btn:hover { color: var(--text); }
+
+    .approach-body {
+      display: none;
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px solid var(--border);
+      font-size: 11.5px;
+      color: var(--text-muted);
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+    .approach-body.open {
+      display: block;
+    }
+
+    /* Pause Banner */
+    .pause-banner {
+      display: none;
+      background: rgba(245, 158, 11, 0.08);
+      border-bottom: 1px solid rgba(245, 158, 11, 0.22);
+      padding: 10px 14px;
+      flex-direction: column;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    .pause-banner.open {
+      display: flex;
+    }
+    .pause-title {
+      font-size: 12px;
+      font-weight: 500;
+      color: #fcd34d;
+    }
+    .pause-desc {
+      font-size: 11.5px;
+      color: var(--text-muted);
+    }
+
+    /* Feed */
+    .feed {
+      flex: 1;
+      overflow-y: auto;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .empty-state {
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: 8px 4px;
+    }
+
+    .empty-title {
+      font-size: 13.5px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 4px;
+    }
+
+    .empty-desc {
+      font-size: 12px;
+      color: var(--text-muted);
+      line-height: 1.45;
+      margin-bottom: 16px;
+    }
+
+    .quick-list {
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .quick-btn {
+      width: 100%;
+      text-align: left;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border);
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .quick-btn:hover {
+      background: rgba(255, 255, 255, 0.07);
+      border-color: var(--border-strong);
+    }
+
+    .quick-btn-title {
+      font-weight: 500;
+      color: var(--text);
+      font-size: 12px;
+      margin-bottom: 2px;
+    }
+
+    .quick-btn-sub {
+      font-size: 11px;
+      color: var(--text-dim);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* Messages */
+    .msg-user-wrap {
+      display: flex;
+      justify-content: flex-end;
+    }
+
+    .msg-user-bubble {
+      max-width: 86%;
+      padding: 9px 12px;
+      border-radius: 12px;
+      border-top-right-radius: 4px;
+      background: #222227;
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.5;
+      word-break: break-word;
+    }
+
+    .msg-agent-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .msg-meta {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      color: var(--text-dim);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .msg-meta-author {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      font-weight: 500;
+      color: var(--text-muted);
+    }
+
+    .notes-toggle {
+      margin-left: auto;
+      background: none;
+      border: none;
+      color: var(--text-dim);
+      font-size: 11px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .notes-toggle:hover {
+      color: var(--text);
+    }
+
+    .msg-agent-text {
+      font-size: 12px;
+      color: var(--text);
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .action-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 8px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .action-type {
+      color: var(--text);
+      font-weight: 500;
+      flex-shrink: 0;
+    }
+
+    .action-target {
+      color: var(--text-muted);
+      flex-shrink: 0;
+    }
+
+    .action-summary {
+      color: var(--text-dim);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .notes-box {
+      display: none;
+      padding: 10px;
+      border-radius: 8px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      font-size: 11px;
+      color: var(--text-muted);
+      line-height: 1.45;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .notes-box.open {
+      display: flex;
+    }
+    .notes-label {
+      color: var(--text);
+      font-weight: 500;
+      margin-bottom: 2px;
+    }
+
+    /* Processing Line */
+    .processing-box {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 14px 8px;
+      font-size: 11.5px;
+      color: var(--text-muted);
+      flex-shrink: 0;
+    }
+    .processing-box.active {
+      display: flex;
+    }
+
+    /* Composer */
+    .composer-wrap {
+      padding: 10px 12px 12px;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .composer {
+      display: flex;
+      align-items: flex-end;
+      gap: 8px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 11px;
+      padding: 6px 8px 6px 12px;
+      transition: border-color 0.15s;
+    }
+    .composer:focus-within {
+      border-color: var(--border-strong);
+    }
+
+    .input-box {
+      flex: 1;
+      background: transparent;
+      border: none;
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.45;
+      outline: none;
+      resize: none;
+      min-height: 24px;
+      max-height: 96px;
+      padding: 3px 0;
+      font-family: inherit;
+    }
+    .input-box::placeholder {
+      color: var(--text-dim);
+    }
+
+    .btn-send {
+      width: 28px;
+      height: 28px;
+      border-radius: 7px;
+      background: var(--accent);
+      color: var(--accent-text);
+      border: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      flex-shrink: 0;
+      transition: opacity 0.15s, background 0.15s;
+    }
+    .btn-send:hover {
+      background: #ffffff;
+    }
+    .btn-send:disabled {
+      opacity: 0.25;
+      cursor: not-allowed;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <header class="header">
+    <div class="header-left">
+      <span class="brand-title">Browser Agent</span>
+      <span class="sep">·</span>
+      <div class="status-text">
+        <span id="statusDot" class="status-dot offline"></span>
+        <span id="statusText">Connecting...</span>
+      </div>
+    </div>
+
+    <div class="header-controls">
+      <button id="btnPause" type="button" class="ctrl-btn" style="display: none;">Pause</button>
+      <button id="btnResume" type="button" class="ctrl-btn primary" style="display: none;">Resume</button>
+      <button id="btnCancel" type="button" class="ctrl-btn danger" style="display: none;">Stop</button>
+
+      <button id="btnSettings" type="button" class="icon-btn" title="Server settings">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- Settings Panel -->
+  <div id="settingsDrawer" class="settings-panel">
+    <div class="settings-header">
+      <span>Server URL</span>
+      <span id="latencyBadge"></span>
+    </div>
+    <div class="settings-input-group">
+      <input type="text" id="serverInput" class="settings-input" placeholder="https://..." spellcheck="false" />
+      <button id="btnSaveServer" type="button" class="btn-save-cfg">Save</button>
+    </div>
+    <button id="btnCloudPreset" type="button" class="btn-link-muted">
+      Reset to default server URL
+    </button>
+  </div>
+
+  <!-- Active Task -->
+  <div id="taskCard" class="task-card">
+    <div class="task-row">
+      <div id="taskTitle" class="task-title"></div>
+      <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0;">
+        <span id="taskSteps" class="task-steps"></span>
+        <button id="approachToggle" type="button" class="approach-btn" title="Show plan">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="6 9 12 15 18 9"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+    <div id="approachText" class="approach-body"></div>
+  </div>
+
+  <!-- Human Action Banner -->
+  <div id="pauseBanner" class="pause-banner">
+    <div class="pause-title">Action required in browser</div>
+    <div class="pause-desc">Complete sign-in or verification in the active tab, then resume.</div>
+    <button id="btnBannerResume" type="button" class="ctrl-btn primary" style="justify-content: center; width: 100%;">
+      Resume task
+    </button>
+  </div>
+
+  <!-- Feed -->
+  <main id="feed" class="feed">
+    <div id="emptyState" class="empty-state">
+      <div class="empty-title">What should Firefox do?</div>
+      <div class="empty-desc">
+        Describe a task in plain language. The agent inspects your active tab, clicks, types, and navigates step by step.
+      </div>
+
+      <div class="quick-list">
+        <button type="button" class="quick-btn" data-prompt="Search the web for the cheapest dumbbells available, scroll through 3 listings, and recommend the best deal.">
+          <div class="quick-btn-title">Compare product prices</div>
+          <div class="quick-btn-sub">Search, scroll listings, and compare options</div>
+        </button>
+        <button type="button" class="quick-btn" data-prompt="Navigate to Wikipedia, search for Alan Turing, scroll to his Enigma work, and summarize it.">
+          <div class="quick-btn-title">Research on Wikipedia</div>
+          <div class="quick-btn-sub">Search an article and summarize a specific section</div>
+        </button>
+        <button type="button" class="quick-btn" data-prompt="Browse Hacker News front page, open the top article, and summarize the discussion.">
+          <div class="quick-btn-title">Summarize Hacker News thread</div>
+          <div class="quick-btn-sub">Open the top post and summarize key points</div>
+        </button>
+      </div>
+    </div>
+  </main>
+
+  <!-- Working Indicator -->
+  <div id="processingBox" class="processing-box">
+    <span class="status-dot working"></span>
+    <span>Working on next step...</span>
+  </div>
+
+  <!-- Composer -->
+  <div class="composer-wrap">
+    <form id="chatForm" class="composer">
+      <textarea
+        id="chatInput"
+        class="input-box"
+        rows="1"
+        placeholder="Tell the agent what to do..."
+      ></textarea>
+      <button type="button" id="btnSubmit" class="btn-send" disabled title="Send">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>
+        </svg>
+      </button>
+    </form>
+  </div>
+
+  <script src="sidebar.js"></script>
+</body>
+</html>
