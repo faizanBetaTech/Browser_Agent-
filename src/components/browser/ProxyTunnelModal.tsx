@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { X, AlertCircle, CheckCircle2, RefreshCw, Copy, Check } from 'lucide-react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { X, AlertCircle, CheckCircle2, RefreshCw, Copy, Check, ChevronDown, ChevronRight } from 'lucide-react';
 import { ProxyTunnelConfig, EgressIpInfo } from '../../types/browser';
 
 interface Props {
@@ -7,6 +7,8 @@ interface Props {
   onClose: () => void;
   onProxyUpdated?: () => void;
 }
+
+const GOST_BORE_CMD = 'gost -L "http://myuser:mypass@127.0.0.1:8080" & bore local 8080 --to bore.pub';
 
 export const ProxyTunnelModal: React.FC<Props> = ({ isOpen, onClose, onProxyUpdated }) => {
   const [proxyConfig, setProxyConfig] = useState<ProxyTunnelConfig>({
@@ -20,15 +22,10 @@ export const ProxyTunnelModal: React.FC<Props> = ({ isOpen, onClose, onProxyUpda
   const [isTesting, setIsTesting] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [showGuide, setShowGuide] = useState(false);
   const [copiedCmd, setCopiedCmd] = useState(false);
 
-  useEffect(() => {
-    if (isOpen) {
-      loadStatus();
-    }
-  }, [isOpen]);
-
-  const loadStatus = async () => {
+  const loadStatus = useCallback(async () => {
     setIsLoading(true);
     setErrorMessage(null);
     try {
@@ -47,7 +44,13 @@ export const ProxyTunnelModal: React.FC<Props> = ({ isOpen, onClose, onProxyUpda
     } finally {
       setIsLoading(false);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    if (isOpen) {
+      loadStatus();
+    }
+  }, [isOpen, loadStatus]);
 
   const handleTestIp = async () => {
     setIsTesting(true);
@@ -67,7 +70,7 @@ export const ProxyTunnelModal: React.FC<Props> = ({ isOpen, onClose, onProxyUpda
     }
   };
 
-  const handleSave = async () => {
+  const applyConfig = async (nextConfig: ProxyTunnelConfig) => {
     setIsLoading(true);
     setErrorMessage(null);
     setSaveSuccess(false);
@@ -75,16 +78,19 @@ export const ProxyTunnelModal: React.FC<Props> = ({ isOpen, onClose, onProxyUpda
       const res = await fetch('/api/proxy/configure', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(proxyConfig),
+        body: JSON.stringify(nextConfig),
       });
       const data = await res.json();
+      if (data.proxyConfig) {
+        setProxyConfig(data.proxyConfig);
+      }
       if (data.success) {
         setSaveSuccess(true);
         if (data.ipInfo) {
           setIpInfo(data.ipInfo);
         }
         onProxyUpdated?.();
-        setTimeout(() => setSaveSuccess(false), 3000);
+        setTimeout(() => setSaveSuccess(false), 2500);
       } else {
         setErrorMessage(data.error || 'Failed to apply proxy settings');
       }
@@ -95,8 +101,25 @@ export const ProxyTunnelModal: React.FC<Props> = ({ isOpen, onClose, onProxyUpda
     }
   };
 
+  const handleToggleEnabled = async (nextEnabled: boolean) => {
+    const nextConfig: ProxyTunnelConfig = {
+      ...proxyConfig,
+      enabled: nextEnabled,
+    };
+    setProxyConfig(nextConfig);
+
+    // Turning OFF or turning ON with a Server URL already filled applies immediately
+    if (!nextEnabled || proxyConfig.server.trim()) {
+      await applyConfig(nextConfig);
+    }
+  };
+
+  const handleSave = async () => {
+    await applyConfig(proxyConfig);
+  };
+
   const copyCmd = () => {
-    navigator.clipboard.writeText('ssh -D 1080 -N localhost');
+    navigator.clipboard.writeText(GOST_BORE_CMD);
     setCopiedCmd(true);
     setTimeout(() => setCopiedCmd(false), 1800);
   };
@@ -165,14 +188,15 @@ export const ProxyTunnelModal: React.FC<Props> = ({ isOpen, onClose, onProxyUpda
               <div>
                 <div className="font-medium text-zinc-100">Enable Proxy</div>
                 <div className="text-zinc-400 mt-0.5">
-                  Applies to all new requests in Chromium.
+                  Only routes Chromium traffic through the proxy when toggled ON.
                 </div>
               </div>
               <label className="relative inline-flex items-center cursor-pointer">
                 <input
                   type="checkbox"
                   checked={proxyConfig.enabled}
-                  onChange={(e) => setProxyConfig({ ...proxyConfig, enabled: e.target.checked })}
+                  disabled={isLoading}
+                  onChange={(e) => handleToggleEnabled(e.target.checked)}
                   className="sr-only peer"
                 />
                 <div className="w-10 h-5 bg-zinc-800 rounded-full peer peer-checked:bg-zinc-100 after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-zinc-400 peer-checked:after:bg-zinc-950 after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-5" />
@@ -183,7 +207,7 @@ export const ProxyTunnelModal: React.FC<Props> = ({ isOpen, onClose, onProxyUpda
               <label className="block font-medium text-zinc-200 mb-1.5">Server URL</label>
               <input
                 type="text"
-                placeholder="socks5://127.0.0.1:1080 or http://host:8080"
+                placeholder="http://bore.pub:12345 or socks5://host:1080"
                 value={proxyConfig.server}
                 onChange={(e) => setProxyConfig({ ...proxyConfig, server: e.target.value })}
                 className="w-full bg-[#0a0a0b] border border-white/[0.1] focus:border-white/[0.3] rounded-lg px-3 py-2 text-xs font-mono text-zinc-100 placeholder:text-zinc-600 outline-none"
@@ -195,7 +219,7 @@ export const ProxyTunnelModal: React.FC<Props> = ({ isOpen, onClose, onProxyUpda
                 <label className="block font-medium text-zinc-200 mb-1.5">Username (optional)</label>
                 <input
                   type="text"
-                  placeholder="Username"
+                  placeholder="myuser"
                   value={proxyConfig.username || ''}
                   onChange={(e) => setProxyConfig({ ...proxyConfig, username: e.target.value })}
                   className="w-full bg-[#0a0a0b] border border-white/[0.1] focus:border-white/[0.3] rounded-lg px-3 py-2 text-xs text-zinc-100 placeholder:text-zinc-600 outline-none"
@@ -206,7 +230,7 @@ export const ProxyTunnelModal: React.FC<Props> = ({ isOpen, onClose, onProxyUpda
                 <label className="block font-medium text-zinc-200 mb-1.5">Password (optional)</label>
                 <input
                   type="password"
-                  placeholder="Password"
+                  placeholder="mypass"
                   value={proxyConfig.password || ''}
                   onChange={(e) => setProxyConfig({ ...proxyConfig, password: e.target.value })}
                   className="w-full bg-[#0a0a0b] border border-white/[0.1] focus:border-white/[0.3] rounded-lg px-3 py-2 text-xs text-zinc-100 placeholder:text-zinc-600 outline-none"
@@ -214,15 +238,38 @@ export const ProxyTunnelModal: React.FC<Props> = ({ isOpen, onClose, onProxyUpda
               </div>
             </div>
 
-            <div className="flex items-center justify-between px-3 py-2 rounded-lg bg-[#0a0a0b] border border-white/[0.06] text-[11px] text-zinc-400">
-              <span className="font-mono">ssh -D 1080 -N localhost</span>
+            {/* Expandable antiX gost + bore guide */}
+            <div className="rounded-lg bg-[#0a0a0b] border border-white/[0.08] overflow-hidden">
               <button
-                onClick={copyCmd}
-                className="text-zinc-400 hover:text-zinc-100 p-1 transition-colors"
-                title="Copy SSH tunnel command"
+                type="button"
+                onClick={() => setShowGuide(!showGuide)}
+                className="w-full px-3 py-2.5 flex items-center justify-between text-left text-zinc-300 hover:text-zinc-100 transition-colors"
               >
-                {copiedCmd ? <Check className="w-3.5 h-3.5 text-zinc-100" /> : <Copy className="w-3.5 h-3.5" />}
+                <span className="font-medium">Use your antiX PC as a free proxy (gost + bore)</span>
+                {showGuide ? <ChevronDown className="w-3.5 h-3.5 text-zinc-500" /> : <ChevronRight className="w-3.5 h-3.5 text-zinc-500" />}
               </button>
+
+              {showGuide && (
+                <div className="px-3 pb-3 pt-1 border-t border-white/[0.06] space-y-2 text-[11px] text-zinc-400">
+                  <p>
+                    Run an authenticated <code className="text-zinc-200">http://</code> proxy on antiX (Chromium supports username/password auth on HTTP proxies, not SOCKS5) and expose it with <code className="text-zinc-200">bore</code>:
+                  </p>
+                  <div className="flex items-center justify-between gap-2 px-2.5 py-2 rounded bg-[#111113] border border-white/[0.08] text-zinc-200">
+                    <code className="font-mono break-all select-all">{GOST_BORE_CMD}</code>
+                    <button
+                      type="button"
+                      onClick={copyCmd}
+                      className="text-zinc-400 hover:text-zinc-100 p-1 shrink-0 transition-colors"
+                      title="Copy command"
+                    >
+                      {copiedCmd ? <Check className="w-3.5 h-3.5 text-zinc-100" /> : <Copy className="w-3.5 h-3.5" />}
+                    </button>
+                  </div>
+                  <p>
+                    Copy the <code className="text-zinc-200">bore.pub:&lt;port&gt;</code> printed in terminal, enter <code className="text-zinc-200">http://bore.pub:&lt;port&gt;</code> plus your username/password above, then toggle Enable Proxy ON.
+                  </p>
+                </div>
+              )}
             </div>
 
             {errorMessage && (
@@ -247,7 +294,7 @@ export const ProxyTunnelModal: React.FC<Props> = ({ isOpen, onClose, onProxyUpda
             onClick={onClose}
             className="px-4 py-1.5 rounded-lg text-xs font-medium text-zinc-400 hover:text-zinc-100 hover:bg-white/[0.05] transition-colors"
           >
-            Cancel
+            Close
           </button>
           <button
             onClick={handleSave}

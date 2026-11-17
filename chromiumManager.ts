@@ -31,12 +31,20 @@ export interface RealBrowserState {
   url: string;
   title: string;
   screenshotBase64: string;
-  cleanedHtml: string;
+  cleanedHtml?: string;
   accessibilityTree: string;
   elementCount: number;
-  rawHtmlLength: number;
-  cleanedHtmlLength: number;
+  rawHtmlLength?: number;
+  cleanedHtmlLength?: number;
   focusedElement?: FocusedElementInfo | null;
+}
+
+interface AxTargetEntry {
+  backendDOMNodeId: number;
+  role: string;
+  name: string;
+  value?: string;
+  url?: string;
 }
 
 class ChromiumManager {
@@ -48,6 +56,9 @@ class ChromiumManager {
   private tabCounter: number = 0;
   // Link map: maps indexed refs like #L1, #L2 to real target URLs
   private linkMap: Map<string, string> = new Map();
+  // Native CDP AX element map: maps el-1, el-2 -> backendDOMNodeId
+  private axTargetMap: Map<string, AxTargetEntry> = new Map();
+  private cdpSessions: WeakMap<Page, any> = new WeakMap();
   private proxyConfig: ProxyTunnelConfig = {
     enabled: false,
     server: '',
@@ -440,6 +451,446 @@ class ChromiumManager {
     return this.linkMap.get(linkId);
   }
 
+  private async getCDPSession(page: Page, forceNew: boolean = false): Promise<any> {
+    if (!this.context) throw new Error('Context not initialized');
+    if (!forceNew && this.cdpSessions.has(page)) {
+      return this.cdpSessions.get(page);
+    }
+    const cdp = await this.context.newCDPSession(page);
+    await cdp.send('DOM.enable').catch(() => {});
+    await cdp.send('Accessibility.enable').catch(() => {});
+    await cdp.send('Page.enable').catch(() => {});
+    this.cdpSessions.set(page, cdp);
+    return cdp;
+  }
+
+  private normalizeTargetId(raw: string): string {
+    return raw.trim().replace(/^\[/, '').replace(/\]$/, '');
+  }
+
+  private quadToBox(quad: number[]): { x: number; y: number; width: number; height: number } | null {
+    if (!Array.isArray(quad) || quad.length < 8) return null;
+    const xs = [quad[0], quad[2], quad[4], quad[6]];
+    const ys = [quad[1], quad[3], quad[5], quad[7]];
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+    return {
+      x: minX,
+      y: minY,
+      width: Math.max(0, maxX - minX),
+      height: Math.max(0, maxY - minY),
+    };
+  }
+
+  private async resolveCdpTarget(
+    page: Page,
+    backendDOMNodeId: number
+  ): Promise<{ cdp: any; box: { x: number; y: number; width: number; height: number } | null; objectId: string | null }> {
+    let cdp = await this.getCDPSession(page);
+    try {
+      await cdp.send('DOM.scrollIntoViewIfNeeded', { backendNodeId: backendDOMNodeId }).catch(() => {});
+    } catch {
+      cdp = await this.getCDPSession(page, true);
+      await cdp.send('DOM.scrollIntoViewIfNeeded', { backendNodeId: backendDOMNodeId }).catch(() => {});
+    }
+
+    let box: { x: number; y: number; width: number; height: number } | null = null;
+    try {
+      const quadsRes = await cdp.send('DOM.getContentQuads', { backendNodeId: backendDOMNodeId });
+      if (Array.isArray(quadsRes?.quads) && quadsRes.quads.length > 0) {
+        const candidate = this.quadToBox(quadsRes.quads[0]);
+        if (candidate && candidate.width > 0 && candidate.height > 0) {
+          box = candidate;
+        }
+      }
+    } catch {}
+
+    if (!box) {
+      try {
+        const boxRes = await cdp.send('DOM.getBoxModel', { backendNodeId: backendDOMNodeId });
+        const candidate = this.quadToBox(boxRes?.model?.border || boxRes?.model?.content);
+        if (candidate && candidate.width > 0 && candidate.height > 0) {
+          box = candidate;
+        }
+      } catch {}
+    }
+
+    let objectId: string | null = null;
+    try {
+      const resolved = await cdp.send('DOM.resolveNode', { backendNodeId: backendDOMNodeId });
+      objectId = resolved?.object?.objectId || null;
+    } catch {}
+
+    if (!box && objectId) {
+      try {
+        const rectRes = await cdp.send('Runtime.callFunctionOn', {
+          objectId,
+          functionDeclaration: `function() {
+            const el = this.nodeType === 3 ? this.parentElement : this;
+            if (!el || typeof el.getBoundingClientRect !== 'function') return null;
+            el.scrollIntoView({ block: 'center', inline: 'center' });
+            const r = el.getBoundingClientRect();
+            return { x: r.left, y: r.top, width: r.width, height: r.height };
+          }`,
+          returnByValue: true,
+        });
+        const v = rectRes?.result?.value;
+        if (v && v.width > 0 && v.height > 0) {
+          box = v;
+        }
+      } catch {}
+    }
+
+    return { cdp, box, objectId };
+  }
+
+  private async extractNativeAccessibilityTree(
+    page: Page
+  ): Promise<{ accessibilityTree: string; elementCount: number }> {
+    this.axTargetMap.clear();
+    this.linkMap.clear();
+
+    let cdp: any;
+    let mainAxRes: any;
+    try {
+      cdp = await this.getCDPSession(page);
+      mainAxRes = await cdp.send('Accessibility.getFullAXTree');
+    } catch {
+      try {
+        cdp = await this.getCDPSession(page, true);
+        mainAxRes = await cdp.send('Accessibility.getFullAXTree');
+      } catch (err: any) {
+        console.error('[Chromium AX] Failed to retrieve native CDP accessibility tree:', err?.message || err);
+        return { accessibilityTree: '', elementCount: 0 };
+      }
+    }
+
+    const childFrameTrees = new Map<string, any[]>();
+    try {
+      const frameTreeRes = await cdp.send('Page.getFrameTree');
+      const collectChildFrameIds = (node: any): string[] => {
+        const ids: string[] = [];
+        if (Array.isArray(node?.childFrames)) {
+          for (const cf of node.childFrames) {
+            if (cf?.frame?.id) ids.push(cf.frame.id);
+            ids.push(...collectChildFrameIds(cf));
+          }
+        }
+        return ids;
+      };
+      const childFrameIds = collectChildFrameIds(frameTreeRes?.frameTree).slice(0, 8);
+      await Promise.all(
+        childFrameIds.map(async (frameId) => {
+          try {
+            const res = await cdp.send('Accessibility.getFullAXTree', { frameId });
+            if (Array.isArray(res?.nodes) && res.nodes.length > 0) {
+              childFrameTrees.set(frameId, res.nodes);
+            }
+          } catch {}
+        })
+      );
+    } catch {}
+
+    const IGNORED_SUBTREE_REASONS = new Set([
+      'notRendered',
+      'ariaHiddenSubtree',
+      'ariaHiddenElement',
+      'inertSubtree',
+      'hiddenElement',
+      'notVisible',
+    ]);
+
+    const INTERACTIVE_ROLES = new Set([
+      'button',
+      'link',
+      'textbox',
+      'searchbox',
+      'combobox',
+      'listbox',
+      'option',
+      'checkbox',
+      'radio',
+      'switch',
+      'tab',
+      'menuitem',
+      'menuitemcheckbox',
+      'menuitemradio',
+      'treeitem',
+      'slider',
+      'spinbutton',
+      'disclosuretriangle',
+    ]);
+
+    const MODAL_ROLES = new Set(['dialog', 'alertdialog', 'menu', 'listbox']);
+    const LANDMARK_ROLES = new Set(['navigation', 'main', 'form', 'alert', 'status']);
+
+    const getProp = (node: any, name: string): any => {
+      if (!Array.isArray(node?.properties)) return undefined;
+      const p = node.properties.find((prop: any) => prop?.name === name);
+      return p?.value?.value;
+    };
+
+    const sanitizeText = (raw: any, maxLen: number): string => {
+      if (raw === undefined || raw === null) return '';
+      return String(raw)
+        .replace(/[\r\n\t]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .replace(/"/g, "'")
+        .trim()
+        .slice(0, maxLen);
+    };
+
+    const isHiddenIgnored = (node: any): boolean => {
+      if (getProp(node, 'hidden') === true) return true;
+      if (!node?.ignored) return false;
+      if (Array.isArray(node?.ignoredReasons)) {
+        return node.ignoredReasons.some((r: any) => IGNORED_SUBTREE_REASONS.has(r?.name));
+      }
+      return false;
+    };
+
+    const lines: string[] = [];
+    let interactiveCounter = 0;
+    let totalChars = 0;
+    const MAX_INTERACTIVE = 220;
+    const MAX_LINES = 360;
+    const MAX_CHARS = 16000;
+    const usedChildFrames = new Set<string>();
+
+    const pushLine = (line: string): boolean => {
+      if (lines.length >= MAX_LINES || totalChars + line.length + 1 > MAX_CHARS) {
+        return false;
+      }
+      lines.push(line);
+      totalChars += line.length + 1;
+      return true;
+    };
+
+    const walkAxNodes = async (
+      nodes: any[],
+      depth: number,
+      insideModal: boolean,
+      suppressedText: string
+    ): Promise<void> => {
+      if (!Array.isArray(nodes) || nodes.length === 0) return;
+      if (lines.length >= MAX_LINES || totalChars >= MAX_CHARS) return;
+
+      const nodeById = new Map<string, any>();
+      for (const n of nodes) {
+        if (n?.nodeId) nodeById.set(n.nodeId, n);
+      }
+
+      const root = nodes[0];
+      const visited = new Set<string>();
+
+      const hasInteractiveChild = (node: any, limitDepth = 3): boolean => {
+        if (!node || limitDepth <= 0 || !Array.isArray(node.childIds)) return false;
+        for (const cid of node.childIds) {
+          const child = nodeById.get(cid);
+          if (!child || isHiddenIgnored(child)) continue;
+          const r = String(child?.role?.value || '').toLowerCase();
+          if (INTERACTIVE_ROLES.has(r) || getProp(child, 'editable')) return true;
+          if (hasInteractiveChild(child, limitDepth - 1)) return true;
+        }
+        return false;
+      };
+
+      const visit = async (
+        nodeId: string,
+        indentLevel: number,
+        inModal: boolean,
+        suppressed: string
+      ): Promise<void> => {
+        if (!nodeId || visited.has(nodeId)) return;
+        if (lines.length >= MAX_LINES || totalChars >= MAX_CHARS) return;
+        visited.add(nodeId);
+
+        const node = nodeById.get(nodeId);
+        if (!node) return;
+        if (isHiddenIgnored(node)) return;
+
+        const rawRole = String(node?.role?.value || '').trim();
+        const roleLower = rawRole.toLowerCase();
+
+        // Always skip low-level InlineTextBox noise
+        if (roleLower === 'inlinetextbox' || roleLower === 'linebreak') return;
+
+        // Handle embedded iframes recursively via child frame AX trees
+        if ((roleLower === 'iframe' || roleLower === 'iframepresentational') && node.backendDOMNodeId) {
+          let matchedFrameId: string | null = null;
+          if (childFrameTrees.size > 0) {
+            try {
+              const desc = await cdp.send('DOM.describeNode', { backendNodeId: node.backendDOMNodeId });
+              const fId = desc?.node?.frameId;
+              if (fId && childFrameTrees.has(fId)) {
+                matchedFrameId = fId;
+              }
+            } catch {}
+          }
+          if (matchedFrameId && !usedChildFrames.has(matchedFrameId)) {
+            usedChildFrames.add(matchedFrameId);
+            const indent = '  '.repeat(Math.min(indentLevel, 4));
+            const frameLabel = sanitizeText(node?.name?.value, 70);
+            pushLine(`${indent}iframe${frameLabel ? ` "${frameLabel}"` : ''}`);
+            await walkAxNodes(childFrameTrees.get(matchedFrameId)!, indentLevel + 1, inModal, suppressed);
+            return;
+          }
+        }
+
+        // Transparently unwrap ignored structural nodes (e.g. generic div wrappers)
+        if (node.ignored) {
+          if (Array.isArray(node.childIds)) {
+            for (const cid of node.childIds) {
+              await visit(cid, indentLevel, inModal, suppressed);
+            }
+          }
+          return;
+        }
+
+        const editableProp = getProp(node, 'editable');
+        const focusableProp = getProp(node, 'focusable') === true;
+        const modalProp = getProp(node, 'modal') === true;
+        const isModalContainer = inModal || MODAL_ROLES.has(roleLower) || modalProp;
+
+        const safeName = sanitizeText(node?.name?.value, 100);
+        const safeValue = sanitizeText(node?.value?.value, 90);
+        const indent = '  '.repeat(Math.min(indentLevel, 4));
+
+        // Normalize effective role cleanly for decisionGate.ts & Brain LLM
+        let effectiveRole = roleLower;
+        if (editableProp && !INTERACTIVE_ROLES.has(roleLower)) {
+          effectiveRole = 'textbox';
+        } else if (roleLower === 'disclosuretriangle') {
+          effectiveRole = 'button';
+        }
+
+        const isAlwaysInputRole =
+          effectiveRole === 'textbox' ||
+          effectiveRole === 'searchbox' ||
+          effectiveRole === 'combobox' ||
+          effectiveRole === 'checkbox' ||
+          effectiveRole === 'radio' ||
+          effectiveRole === 'switch' ||
+          effectiveRole === 'slider' ||
+          effectiveRole === 'spinbutton';
+
+        const isInteractiveCandidate =
+          Boolean(node.backendDOMNodeId) &&
+          interactiveCounter < MAX_INTERACTIVE &&
+          (INTERACTIVE_ROLES.has(effectiveRole) ||
+            (effectiveRole === 'gridcell' && safeName.length > 0 && safeName.length <= 60 && !hasInteractiveChild(node, 2)) ||
+            (focusableProp &&
+              (effectiveRole === 'generic' || effectiveRole === 'cell' || effectiveRole === 'listitem' || effectiveRole === 'row') &&
+              safeName.length > 0 &&
+              safeName.length <= 80 &&
+              !hasInteractiveChild(node, 2))) &&
+          (safeName.length > 0 || safeValue.length > 0 || isAlwaysInputRole);
+
+        let nextIndent = indentLevel;
+        let nextSuppressed = suppressed;
+
+        if (isInteractiveCandidate) {
+          const id = `el-${++interactiveCounter}`;
+          const linkUrl = getProp(node, 'url');
+          this.axTargetMap.set(id, {
+            backendDOMNodeId: node.backendDOMNodeId,
+            role: effectiveRole,
+            name: safeName,
+            value: safeValue || undefined,
+            url: typeof linkUrl === 'string' ? linkUrl : undefined,
+          });
+          if (typeof linkUrl === 'string' && linkUrl.startsWith('http')) {
+            this.linkMap.set(id, linkUrl);
+          }
+
+          const extras: string[] = [];
+          const expanded = getProp(node, 'expanded');
+          const selected = getProp(node, 'selected');
+          const checked = getProp(node, 'checked');
+          const focused = getProp(node, 'focused');
+          const disabled = getProp(node, 'disabled');
+
+          if (expanded !== undefined) extras.push(`expanded: ${expanded}`);
+          if (selected === true) extras.push('selected: true');
+          if (checked !== undefined && checked !== 'false' && checked !== false) extras.push(`checked: ${checked}`);
+          if (disabled === true) extras.push('disabled: true');
+          if (focused === true) extras.push('focused: true');
+          if (inModal || modalProp) extras.push('in_modal: true');
+
+          let line = `${indent}- [${id}] ${effectiveRole} "${safeName}"`;
+          if (safeValue && safeValue !== safeName) {
+            line += ` (value: "${safeValue}")`;
+          }
+          if (extras.length > 0) {
+            line += ` [${extras.join(', ')}]`;
+          }
+
+          pushLine(line);
+          if (safeName) {
+            nextSuppressed = safeName.toLowerCase();
+          }
+          // For listbox/combobox/menu, allow children to indent underneath; for leaf controls, suppress redundant child text
+          if (MODAL_ROLES.has(effectiveRole) || effectiveRole === 'combobox') {
+            nextIndent = indentLevel + 1;
+          }
+        } else if (MODAL_ROLES.has(roleLower) || modalProp) {
+          pushLine(`${indent}${roleLower}${safeName ? ` "${safeName}"` : ''} [modal]`);
+          nextIndent = indentLevel + 1;
+        } else if (roleLower === 'heading' && safeName) {
+          const level = getProp(node, 'level');
+          if (!hasInteractiveChild(node, 2)) {
+            pushLine(`${indent}heading${level ? ` [${level}]` : ''} "${safeName}"`);
+            nextSuppressed = safeName.toLowerCase();
+          } else {
+            nextIndent = indentLevel;
+          }
+        } else if (LANDMARK_ROLES.has(roleLower) && (safeName || roleLower === 'alert' || roleLower === 'status')) {
+          pushLine(`${indent}${roleLower}${safeName ? ` "${safeName}"` : ''}`);
+          nextIndent = indentLevel + 1;
+          if (safeName) nextSuppressed = safeName.toLowerCase();
+        } else if (roleLower === 'statictext') {
+          const cleanText = sanitizeText(node?.name?.value, 180);
+          const norm = cleanText.toLowerCase();
+          const isTrivialPunctuation = /^[\s|/\-•·›»<>:;,.()\[\]{}—–]+$/.test(cleanText);
+          const isDuplicate = Boolean(suppressed && (suppressed === norm || suppressed.includes(norm)));
+          if (cleanText.length > 0 && !isTrivialPunctuation && !isDuplicate) {
+            pushLine(`${indent}text "${cleanText}"`);
+          }
+          return;
+        }
+
+        if (Array.isArray(node.childIds)) {
+          for (const cid of node.childIds) {
+            await visit(cid, nextIndent, isModalContainer, nextSuppressed);
+          }
+        }
+      };
+
+      if (root?.nodeId) {
+        await visit(root.nodeId, depth, insideModal, suppressedText);
+      }
+    };
+
+    if (Array.isArray(mainAxRes?.nodes)) {
+      await walkAxNodes(mainAxRes.nodes, 0, false, '');
+    }
+
+    // Include any child frame AX trees that were not matched inline via an Iframe node
+    for (const [frameId, frameNodes] of childFrameTrees.entries()) {
+      if (usedChildFrames.has(frameId)) continue;
+      if (lines.length >= MAX_LINES || totalChars >= MAX_CHARS) break;
+      pushLine('iframe "Embedded Frame"');
+      await walkAxNodes(frameNodes, 1, false, '');
+    }
+
+    return {
+      accessibilityTree: lines.join('\n'),
+      elementCount: interactiveCounter,
+    };
+  }
+
   public async getState(): Promise<RealBrowserState> {
     await this.init();
     const page = await this.getActivePage();
@@ -456,146 +907,17 @@ class ChromiumManager {
       console.warn('Screenshot capture notice:', e);
     }
 
-    // Annotate interactive elements directly in the real page DOM and construct compact accessibility tree
-    let accessibilityTree = '';
-    try {
-      const axScript = `
-        (() => {
-          // 1. Remove previous IDs to guarantee 100% unique, sequential, collision-free numbering
-          document.querySelectorAll('[data-agent-id]').forEach((e) => e.removeAttribute('data-agent-id'));
-          document.querySelectorAll('[data-in-modal]').forEach((e) => e.removeAttribute('data-in-modal'));
+    // Extract native Chromium CDP Accessibility Tree (pierces Shadow DOM + child iframes)
+    const { accessibilityTree, elementCount } = await this.extractNativeAccessibilityTree(page);
 
-          const getAccessibleName = (el) => {
-            return (
-              el.getAttribute('aria-label') ||
-              el.getAttribute('placeholder') ||
-              el.getAttribute('title') ||
-              (el.innerText ? el.innerText.trim() : '') ||
-              el.getAttribute('alt') ||
-              ''
-            );
-          };
-
-          const getRole = (el) => {
-            if (el.getAttribute('role')) return el.getAttribute('role');
-            const tag = el.tagName.toLowerCase();
-            if (tag === 'a' && el.hasAttribute('href')) return 'link';
-            if (tag === 'button') return 'button';
-            if (tag === 'input') {
-              const type = el.getAttribute('type') || 'text';
-              if (type === 'search') return 'searchbox';
-              if (type === 'checkbox') return 'checkbox';
-              if (type === 'radio') return 'radio';
-              if (type === 'submit' || type === 'button') return 'button';
-              return 'textbox';
-            }
-            if (tag === 'select') return 'combobox';
-            if (tag === 'textarea') return 'textbox';
-            if (tag === 'summary') return 'button';
-            return null;
-          };
-
-          // 2. Comprehensive selector for ANY interactive element on modern web SPAs (modals, calendars, comboboxes, options)
-          const interactiveSelector = [
-            'a[href]',
-            'button',
-            'input',
-            'textarea',
-            'select',
-            '[role="button"]',
-            '[role="link"]',
-            '[role="tab"]',
-            '[role="menuitem"]',
-            '[role="menuitemcheckbox"]',
-            '[role="menuitemradio"]',
-            '[role="combobox"]',
-            '[role="option"]',
-            '[role="listbox"]',
-            '[role="checkbox"]',
-            '[role="radio"]',
-            '[role="switch"]',
-            '[role="gridcell"]',
-            '[role="row"]',
-            '[role="treeitem"]',
-            '[role="searchbox"]',
-            'summary',
-            '[tabindex="0"]',
-            '[contenteditable="true"]',
-            '[aria-haspopup="true"]',
-            '[aria-expanded]',
-            '[onclick]'
-          ].join(', ');
-
-          const elements = document.querySelectorAll(interactiveSelector);
-          let counter = 1;
-          const axLines = [];
-
-          elements.forEach((el) => {
-            if (!(el instanceof HTMLElement)) return;
-
-            // Check if element is genuinely visible or rendered in viewport/modal
-            const style = window.getComputedStyle(el);
-            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
-              // Check if it is inside an open modal or combobox popup
-              const insideActiveModal = el.closest(
-                'dialog[open], [role="dialog"], [role="listbox"], [role="menu"], [aria-modal="true"]'
-              );
-              if (!insideActiveModal) return;
-            }
-
-            const id = 'el-' + (counter++);
-            el.setAttribute('data-agent-id', id);
-
-            const role = getRole(el) || 'element';
-            const name = getAccessibleName(el).replace(/\\s+/g, ' ').slice(0, 90);
-            const value = el.value || '';
-
-            const extras = [];
-            if (el.getAttribute('aria-expanded')) extras.push('expanded: ' + el.getAttribute('aria-expanded'));
-            if (el.getAttribute('aria-selected')) extras.push('selected: ' + el.getAttribute('aria-selected'));
-            if (el.checked) extras.push('checked: true');
-            if (document.activeElement === el) extras.push('focused: true');
-
-            // Mark modal children so the agent clearly sees they belong to an active overlay
-            const parentModal = el.closest(
-              'dialog[open], [role="dialog"], [aria-modal="true"], [role="listbox"], [role="menu"]'
-            );
-            if (parentModal) {
-              el.setAttribute('data-in-modal', 'true');
-              extras.push('in_modal: true');
-            }
-
-            let line = '- [' + id + '] ' + role + ' "' + name + '"';
-            if (value && value !== name) line += ' (value: "' + value + '")';
-            if (extras.length > 0) line += ' [' + extras.join(', ') + ']';
-            axLines.push(line);
-          });
-
-          return axLines.join('\\n');
-        })()
-      `;
-      const axResult = await page.evaluate(axScript);
-      accessibilityTree = (axResult as string) || '';
-    } catch (err: any) {
-      console.error('AX EVAL ERROR:', err?.message || err);
-      accessibilityTree = '';
-    }
-
-    // Capture and clean DOM
-    let rawHtml = '';
-    try {
-      rawHtml = await page.content();
-    } catch (e) {
-      rawHtml = '<html><body></body></html>';
-    }
-
-    const { cleanedHtml, originalLength, cleanedLength, elementCount } = this.cleanHtml(rawHtml);
-
-    // Capture currently focused element on page
+    // Capture currently focused element on page (including Shadow DOM activeElement)
     let focusedElement: FocusedElementInfo | null = null;
     try {
       focusedElement = await page.evaluate(() => {
-        const el = document.activeElement;
+        let el: Element | null = document.activeElement;
+        while (el && (el as HTMLElement).shadowRoot && (el as HTMLElement).shadowRoot!.activeElement) {
+          el = (el as HTMLElement).shadowRoot!.activeElement;
+        }
         if (!el || el === document.body || el === document.documentElement) return null;
         const tag = el.tagName.toLowerCase();
         const isInput = tag === 'input' || tag === 'textarea' || el.getAttribute('contenteditable') === 'true';
@@ -616,11 +938,8 @@ class ChromiumManager {
       url,
       title,
       screenshotBase64,
-      cleanedHtml,
       accessibilityTree,
       elementCount,
-      rawHtmlLength: originalLength,
-      cleanedHtmlLength: cleanedLength,
       focusedElement,
     };
   }
@@ -732,23 +1051,13 @@ class ChromiumManager {
         }
       }
 
-      if (selector.startsWith('el-')) {
-        selector = `[data-agent-id="${selector}"]`;
-      }
+      const initialPagesCount = this.context?.pages().length || 1;
+      const axId = this.normalizeTargetId(selector);
+      const axEntry = this.axTargetMap.get(axId);
+      let clicked = false;
 
-      let el = await page.$(selector);
-
-      if (!el && !selector.startsWith('[') && !selector.startsWith('.') && !selector.startsWith('#')) {
-        el = await page.$(`button:has-text("${selector}"), a:has-text("${selector}")`);
-      }
-
-      if (el) {
-        await el.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
-
-        const initialPagesCount = this.context?.pages().length || 1;
-
-        // Natural human-like click with realistic mouse physics
-        const box = await el.boundingBox();
+      if (axEntry) {
+        const { cdp, box, objectId } = await this.resolveCdpTarget(page, axEntry.backendDOMNodeId);
         if (box) {
           const clickX = box.x + box.width / 2 + (Math.random() * 4 - 2);
           const clickY = box.y + box.height / 2 + (Math.random() * 4 - 2);
@@ -756,19 +1065,47 @@ class ChromiumManager {
           await page.mouse.down().catch(() => {});
           await new Promise((r) => setTimeout(r, 45 + Math.random() * 30));
           await page.mouse.up().catch(() => {});
-        } else {
-          await el.click({ timeout: 3000 }).catch(async () => {
-            // Fallback for elements under backdrop overlays or modals
-            await el.click({ force: true, timeout: 2000 }).catch(async () => {
-              await el.evaluate((e: any) => e.click()).catch(() => {});
-            });
-          });
+          clicked = true;
+        } else if (objectId) {
+          await cdp
+            .send('Runtime.callFunctionOn', {
+              objectId,
+              functionDeclaration:
+                'function() { const t = this.nodeType === 3 ? this.parentElement : this; if (t && typeof t.click === "function") t.click(); }',
+            })
+            .catch(() => {});
+          clicked = true;
+        }
+      } else {
+        let el = await page.$(selector);
+        if (!el && !selector.startsWith('[') && !selector.startsWith('.') && !selector.startsWith('#')) {
+          el = await page.$(`button:has-text("${selector}"), a:has-text("${selector}")`);
         }
 
-        // Brief delay for DOM or popup trigger
+        if (el) {
+          await el.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+          const box = await el.boundingBox();
+          if (box) {
+            const clickX = box.x + box.width / 2 + (Math.random() * 4 - 2);
+            const clickY = box.y + box.height / 2 + (Math.random() * 4 - 2);
+            await page.mouse.move(clickX, clickY, { steps: 8 }).catch(() => {});
+            await page.mouse.down().catch(() => {});
+            await new Promise((r) => setTimeout(r, 45 + Math.random() * 30));
+            await page.mouse.up().catch(() => {});
+          } else {
+            await el.click({ timeout: 3000 }).catch(async () => {
+              await el!.click({ force: true, timeout: 2000 }).catch(async () => {
+                await el!.evaluate((e: any) => e.click()).catch(() => {});
+              });
+            });
+          }
+          clicked = true;
+        }
+      }
+
+      if (clicked) {
         await page.waitForTimeout(400).catch(() => {});
 
-        // Check if a new tab / popup was opened by the website (e.g. window.open or target="_blank")
         const currentPages = this.context?.pages() || [];
         if (currentPages.length > initialPagesCount) {
           const newestPage = currentPages[currentPages.length - 1];
@@ -875,25 +1212,36 @@ class ChromiumManager {
     const page = await this.getActivePage();
 
     try {
-      let selector = target.trim();
-      if (selector.startsWith('el-')) {
-        selector = `[data-agent-id="${selector}"]`;
-      }
+      const selector = target.trim();
+      const axId = this.normalizeTargetId(selector);
+      const axEntry = this.axTargetMap.get(axId);
 
-      const el = await page.$(selector);
-      if (el) {
-        await el.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
-        const box = await el.boundingBox();
+      if (axEntry) {
+        const { box } = await this.resolveCdpTarget(page, axEntry.backendDOMNodeId);
         if (box) {
           await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 8 });
           await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2, { button: 'right' });
-        } else {
-          await el.click({ button: 'right', timeout: 3000 });
+          await page.waitForTimeout(400).catch(() => {});
+          const state = await this.getState();
+          return { success: true, message: `Right-clicked ${selector}`, state };
         }
-        await page.waitForTimeout(400).catch(() => {});
-        const state = await this.getState();
-        return { success: true, message: `Right-clicked ${selector}`, state };
+      } else {
+        const el = await page.$(selector);
+        if (el) {
+          await el.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+          const box = await el.boundingBox();
+          if (box) {
+            await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 8 });
+            await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2, { button: 'right' });
+          } else {
+            await el.click({ button: 'right', timeout: 3000 });
+          }
+          await page.waitForTimeout(400).catch(() => {});
+          const state = await this.getState();
+          return { success: true, message: `Right-clicked ${selector}`, state };
+        }
       }
+
       const state = await this.getState();
       return { success: false, message: `Element not found: ${selector}`, state };
     } catch (err: any) {
@@ -907,24 +1255,34 @@ class ChromiumManager {
     const page = await this.getActivePage();
 
     try {
-      let selector = target.trim();
-      if (selector.startsWith('el-')) {
-        selector = `[data-agent-id="${selector}"]`;
-      }
+      const selector = target.trim();
+      const axId = this.normalizeTargetId(selector);
+      const axEntry = this.axTargetMap.get(axId);
 
-      const el = await page.$(selector);
-      if (el) {
-        await el.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
-        const box = await el.boundingBox();
+      if (axEntry) {
+        const { box } = await this.resolveCdpTarget(page, axEntry.backendDOMNodeId);
         if (box) {
           await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 8 });
-        } else {
-          await el.hover({ timeout: 3000 });
+          await page.waitForTimeout(400).catch(() => {});
+          const state = await this.getState();
+          return { success: true, message: `Hovered over ${selector}`, state };
         }
-        await page.waitForTimeout(400).catch(() => {});
-        const state = await this.getState();
-        return { success: true, message: `Hovered over ${selector}`, state };
+      } else {
+        const el = await page.$(selector);
+        if (el) {
+          await el.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+          const box = await el.boundingBox();
+          if (box) {
+            await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 8 });
+          } else {
+            await el.hover({ timeout: 3000 });
+          }
+          await page.waitForTimeout(400).catch(() => {});
+          const state = await this.getState();
+          return { success: true, message: `Hovered over ${selector}`, state };
+        }
       }
+
       const state = await this.getState();
       return { success: false, message: `Element not found: ${selector}`, state };
     } catch (err: any) {
@@ -953,44 +1311,59 @@ class ChromiumManager {
     const page = await this.getActivePage();
 
     try {
-      let srcSelector = source.trim();
-      if (srcSelector.startsWith('el-')) srcSelector = `[data-agent-id="${srcSelector}"]`;
-      let tgtSelector = target.trim();
-      if (tgtSelector.startsWith('el-')) tgtSelector = `[data-agent-id="${tgtSelector}"]`;
+      const srcId = this.normalizeTargetId(source);
+      const tgtId = this.normalizeTargetId(target);
+      const srcAx = this.axTargetMap.get(srcId);
+      const tgtAx = this.axTargetMap.get(tgtId);
 
-      const srcEl = await page.$(srcSelector);
-      const tgtEl = await page.$(tgtSelector);
+      let srcBox: { x: number; y: number; width: number; height: number } | null = null;
+      let tgtBox: { x: number; y: number; width: number; height: number } | null = null;
 
-      if (srcEl && tgtEl) {
-        await srcEl.scrollIntoViewIfNeeded().catch(() => {});
-        const srcBox = await srcEl.boundingBox();
-        const tgtBox = await tgtEl.boundingBox();
-
-        if (srcBox && tgtBox) {
-          const fromX = srcBox.x + srcBox.width / 2;
-          const fromY = srcBox.y + srcBox.height / 2;
-          const toX = tgtBox.x + tgtBox.width / 2;
-          const toY = tgtBox.y + tgtBox.height / 2;
-
-          await page.mouse.move(fromX, fromY, { steps: 6 });
-          await page.mouse.down();
-          await new Promise((r) => setTimeout(r, 120));
-          await page.mouse.move(toX, toY, { steps: 16 });
-          await new Promise((r) => setTimeout(r, 100));
-          await page.mouse.up();
-          await page.waitForTimeout(400).catch(() => {});
-
-          const state = await this.getState();
-          return { success: true, message: `Dragged ${source} to ${target}`, state };
+      if (srcAx) {
+        srcBox = (await this.resolveCdpTarget(page, srcAx.backendDOMNodeId)).box;
+      } else {
+        const srcEl = await page.$(source.trim());
+        if (srcEl) {
+          await srcEl.scrollIntoViewIfNeeded().catch(() => {});
+          srcBox = await srcEl.boundingBox();
         }
       }
 
-      // Fallback to Playwright locator dragTo
-      try {
-        await page.locator(srcSelector).dragTo(page.locator(tgtSelector), { timeout: 4000 });
-        const fallbackState = await this.getState();
-        return { success: true, message: `Dragged ${source} to ${target}`, state: fallbackState };
-      } catch {}
+      if (tgtAx) {
+        tgtBox = (await this.resolveCdpTarget(page, tgtAx.backendDOMNodeId)).box;
+      } else {
+        const tgtEl = await page.$(target.trim());
+        if (tgtEl) {
+          await tgtEl.scrollIntoViewIfNeeded().catch(() => {});
+          tgtBox = await tgtEl.boundingBox();
+        }
+      }
+
+      if (srcBox && tgtBox) {
+        const fromX = srcBox.x + srcBox.width / 2;
+        const fromY = srcBox.y + srcBox.height / 2;
+        const toX = tgtBox.x + tgtBox.width / 2;
+        const toY = tgtBox.y + tgtBox.height / 2;
+
+        await page.mouse.move(fromX, fromY, { steps: 6 });
+        await page.mouse.down();
+        await new Promise((r) => setTimeout(r, 120));
+        await page.mouse.move(toX, toY, { steps: 16 });
+        await new Promise((r) => setTimeout(r, 100));
+        await page.mouse.up();
+        await page.waitForTimeout(400).catch(() => {});
+
+        const state = await this.getState();
+        return { success: true, message: `Dragged ${source} to ${target}`, state };
+      }
+
+      if (!srcAx && !tgtAx) {
+        try {
+          await page.locator(source.trim()).dragTo(page.locator(target.trim()), { timeout: 4000 });
+          const fallbackState = await this.getState();
+          return { success: true, message: `Dragged ${source} to ${target}`, state: fallbackState };
+        } catch {}
+      }
 
       const notFoundState = await this.getState();
       return { success: false, message: `Drag target(s) not found`, state: notFoundState };
@@ -1005,49 +1378,104 @@ class ChromiumManager {
     const page = await this.getActivePage();
 
     try {
-      let selector = target.trim();
-      if (selector.startsWith('el-')) {
-        selector = `[data-agent-id="${selector}"]`;
-      }
+      const selector = target.trim();
+      const axId = this.normalizeTargetId(selector);
+      const axEntry = this.axTargetMap.get(axId);
 
-      let el = await page.$(selector);
-      if (!el) {
-        el = await page.$('input[type="text"], input[type="search"], textarea, input:not([type="hidden"])');
-      }
+      let didType = false;
 
-      if (el) {
-        await el.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
-        await el.click({ timeout: 2000 }).catch(() => {});
+      if (axEntry) {
+        const { cdp, box, objectId } = await this.resolveCdpTarget(page, axEntry.backendDOMNodeId);
 
-        // If the clicked element opened or focused an internal input (combobox pattern)
-        let targetInput = el;
-        const tagName = await el.evaluate((e) => e.tagName.toLowerCase()).catch(() => 'input');
-        if (tagName !== 'input' && tagName !== 'textarea') {
-          const innerInput = await el.$('input, textarea');
-          if (innerInput) {
-            targetInput = innerInput;
+        if (box) {
+          await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2).catch(() => {});
+          await page.waitForTimeout(100).catch(() => {});
+        }
+        await cdp.send('DOM.focus', { backendNodeId: axEntry.backendDOMNodeId }).catch(() => {});
+
+        let handledAsSelect = false;
+        if (objectId) {
+          try {
+            const res = await cdp.send('Runtime.callFunctionOn', {
+              objectId,
+              arguments: [{ value }],
+              functionDeclaration: `function(val) {
+                const el = this.nodeType === 3 ? this.parentElement : this;
+                if (!el) return { isSelect: false };
+                if (el.tagName === 'SELECT') {
+                  const sel = el;
+                  const targetLower = String(val || '').toLowerCase();
+                  const opt = Array.from(sel.options).find(
+                    (o) => o.value.toLowerCase() === targetLower || o.text.toLowerCase().includes(targetLower)
+                  );
+                  if (opt) {
+                    sel.value = opt.value;
+                    sel.dispatchEvent(new Event('input', { bubbles: true }));
+                    sel.dispatchEvent(new Event('change', { bubbles: true }));
+                  }
+                  return { isSelect: true };
+                }
+                const inner = (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)
+                  ? el
+                  : el.querySelector('input, textarea, [contenteditable="true"]');
+                if (inner && typeof inner.focus === 'function') {
+                  inner.focus();
+                } else if (typeof el.focus === 'function') {
+                  el.focus();
+                }
+                return { isSelect: false };
+              }`,
+              returnByValue: true,
+            });
+            handledAsSelect = Boolean(res?.result?.value?.isSelect);
+          } catch {}
+        }
+
+        if (!handledAsSelect) {
+          await page.keyboard.press('Control+A').catch(() => {});
+          await page.keyboard.press('Backspace').catch(() => {});
+          await page.keyboard.type(value, { delay: 15 });
+        }
+        didType = true;
+      } else {
+        let el = await page.$(selector);
+        if (!el) {
+          el = await page.$('input[type="text"], input[type="search"], textarea, input:not([type="hidden"])');
+        }
+
+        if (el) {
+          await el.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+          await el.click({ timeout: 2000 }).catch(() => {});
+
+          let targetInput = el;
+          const tagName = await el.evaluate((e) => e.tagName.toLowerCase()).catch(() => 'input');
+          if (tagName !== 'input' && tagName !== 'textarea') {
+            const innerInput = await el.$('input, textarea');
+            if (innerInput) {
+              targetInput = innerInput;
+            }
           }
-        }
 
-        // Clear existing value thoroughly
-        try {
-          await targetInput.fill('');
-        } catch {
-          await page.keyboard.press('Control+A');
-          await page.keyboard.press('Backspace');
-        }
+          try {
+            await targetInput.fill('');
+          } catch {
+            await page.keyboard.press('Control+A');
+            await page.keyboard.press('Backspace');
+          }
 
-        // Realistic typing
-        await targetInput.type(value, { delay: 15 });
+          await targetInput.type(value, { delay: 15 });
+          didType = true;
+        }
+      }
+
+      if (didType) {
         await page.waitForTimeout(400).catch(() => {});
 
-        // Check if an autocomplete dropdown or option appeared (combobox like Google Flights / Travel sites)
         const hasSuggestionOption = await page.$(
           '[role="listbox"] [role="option"], ul[role="listbox"] li, div[role="option"], li[role="option"], .sbqs_c'
         );
 
         if (submit || hasSuggestionOption) {
-          // Press Enter to lock in the autocomplete selection
           await page.keyboard.press('Enter').catch(() => {});
           await page.waitForTimeout(600).catch(() => {});
         } else {
@@ -1080,50 +1508,6 @@ class ChromiumManager {
     return this.getState();
   }
 
-  public cleanHtml(html: string): { cleanedHtml: string; originalLength: number; cleanedLength: number; elementCount: number } {
-    const originalLength = html.length;
-
-    // 1. Strip script, style, svg, noscript, audio, video tags
-    let clean = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
-    clean = clean.replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '');
-    clean = clean.replace(/<svg\b[^<]*(?:(?!<\/svg>)<[^<]*)*<\/svg>/gi, '[SVG]');
-    clean = clean.replace(/<noscript\b[^<]*(?:(?!<\/noscript>)<[^<]*)*<\/noscript>/gi, '');
-    clean = clean.replace(/<!--[\s\S]*?-->/g, ''); // Comments
-
-    // 2. Strip tracking & noisy attributes
-    clean = clean.replace(/\s(class|style|onload|onclick|onerror|target|rel|jsaction|jscontroller|jsdata|data-ved|ping)="[^"]*"/gi, '');
-
-    // 3. Map URLs to short numbered tokens #L1, #L2
-    this.linkMap.clear();
-    let linkCounter = 1;
-
-    clean = clean.replace(/href="([^"]+)"/gi, (_match, url) => {
-      if (url.startsWith('javascript:') || url.startsWith('mailto:') || url === '#') {
-        return 'href="#"';
-      }
-      const token = `L${linkCounter++}`;
-      this.linkMap.set(token, url);
-      this.linkMap.set(`#${token}`, url);
-      return `href="#${token}"`;
-    });
-
-    // 4. Compact whitespace
-    clean = clean.replace(/\n\s*\n/g, '\n');
-    clean = clean.replace(/[ \t]+/g, ' ');
-
-    let elementCount = (clean.match(/data-agent-id="[^"]+"/g) || []).length;
-    if (elementCount === 0) {
-      elementCount = (clean.match(/<(a|button|input|select|textarea)\b/gi) || []).length;
-    }
-
-    return {
-      cleanedHtml: clean.trim(),
-      originalLength,
-      cleanedLength: clean.length,
-      elementCount,
-    };
-  }
-
   public getProxyConfig(): ProxyTunnelConfig {
     return { ...this.proxyConfig };
   }
@@ -1136,6 +1520,14 @@ class ChromiumManager {
       password: (config.password || '').trim(),
     };
 
+    let previousUrl = '';
+    try {
+      const current = this.pages.get(this.activePageId);
+      if (current && !current.isClosed()) {
+        previousUrl = current.url();
+      }
+    } catch {}
+
     // Re-create context with new proxy configuration
     if (this.context) {
       try {
@@ -1144,8 +1536,14 @@ class ChromiumManager {
       this.context = null;
       this.pages.clear();
       this.activePageId = 'tab-1';
-      this.tabCounter = 1;
+      this.tabCounter = 0;
       await this.init();
+      if (previousUrl && previousUrl.startsWith('http') && !previousUrl.includes('www.google.com')) {
+        const active = await this.getActivePage().catch(() => null);
+        if (active) {
+          await active.goto(previousUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+        }
+      }
     }
 
     // Check egress IP through the active browser

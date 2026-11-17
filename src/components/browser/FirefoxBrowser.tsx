@@ -410,7 +410,7 @@ export const FirefoxBrowser: React.FC<Props> = ({
                   <span>Stripped (Styles/Scripts stripped): <strong className="text-emerald-400">{(realBrowserState?.cleanedHtmlLength || 0).toLocaleString()} chars</strong></span>
                   <span>Token Reduction: <strong className="text-orange-400">
                     {realBrowserState?.rawHtmlLength
-                      ? `~${Math.round(((realBrowserState.rawHtmlLength - realBrowserState.cleanedHtmlLength) / realBrowserState.rawHtmlLength) * 100)}%`
+                      ? `~${Math.round(((realBrowserState.rawHtmlLength - (realBrowserState.cleanedHtmlLength || 0)) / realBrowserState.rawHtmlLength) * 100)}%`
                       : '0%'}
                   </strong></span>
                   <button

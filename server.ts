@@ -148,6 +148,10 @@ app.get('/api/extension/download', (req: Request, res: Response) => {
 
 // --- Stealth Tunnel & Proxy Management Endpoints ---
 
+app.get('/api/health', (_req: Request, res: Response) => {
+  return res.json({ ok: true, status: 'healthy' });
+});
+
 app.get('/api/proxy/status', (_req: Request, res: Response) => {
   try {
     const proxyConfig = chromiumManager.getProxyConfig();
@@ -162,13 +166,24 @@ app.get('/api/proxy/status', (_req: Request, res: Response) => {
 
 app.post('/api/proxy/configure', async (req: Request, res: Response) => {
   try {
-    const { enabled, server, username, password } = req.body;
+    const { enabled, server, username, password } = req.body || {};
+    const wantEnabled = Boolean(enabled);
+
+    if (wantEnabled && !String(server || '').trim()) {
+      return res.json({
+        success: false,
+        proxyConfig: chromiumManager.getProxyConfig(),
+        error: 'Enter a Proxy Server URL first (for example http://bore.pub:12345).',
+      });
+    }
+
     const result = await chromiumManager.setProxyConfig({
-      enabled: Boolean(enabled),
-      server: server || '',
+      enabled: wantEnabled,
+      server: wantEnabled ? String(server || '') : String(server || ''),
       username: username || '',
       password: password || '',
     });
+
     return res.json({
       success: result.success,
       proxyConfig: chromiumManager.getProxyConfig(),

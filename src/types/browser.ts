@@ -149,11 +149,11 @@ export interface RealBrowserStateResponse {
   url: string;
   title: string;
   screenshotBase64: string;
-  cleanedHtml: string;
+  cleanedHtml?: string;
   accessibilityTree?: string;
   elementCount: number;
-  rawHtmlLength: number;
-  cleanedHtmlLength: number;
+  rawHtmlLength?: number;
+  cleanedHtmlLength?: number;
   focusedElement?: FocusedElementInfo | null;
   isLocalBrowser?: boolean;
   clientName?: string;

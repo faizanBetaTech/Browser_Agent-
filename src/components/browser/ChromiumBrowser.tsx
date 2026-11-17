@@ -286,10 +286,10 @@ export const ChromiumBrowser: React.FC<Props> = ({
                 ? 'bg-zinc-100 text-zinc-950'
                 : 'text-zinc-400 hover:text-zinc-100 hover:bg-white/[0.06]'
             }`}
-            title="Toggle DOM inspector"
+            title="Toggle Accessibility Tree inspector"
           >
             <Code2 className="w-3.5 h-3.5" />
-            <span className="hidden lg:inline">DOM</span>
+            <span className="hidden lg:inline">AX</span>
           </button>
         </div>
       </div>
@@ -423,7 +423,7 @@ export const ChromiumBrowser: React.FC<Props> = ({
                       : 'text-zinc-500 border-transparent hover:text-zinc-300'
                   }`}
                 >
-                  DOM ({realBrowserState?.cleanedHtmlLength?.toLocaleString() || 0})
+                  AX Tree ({realBrowserState?.elementCount || 0})
                 </button>
                 <button
                   onClick={() => setDevTab('action')}
@@ -449,15 +449,9 @@ export const ChromiumBrowser: React.FC<Props> = ({
               {devTab === 'overview' && (
                 <div className="grid grid-cols-3 gap-4 max-w-2xl">
                   <div className="p-3 rounded-lg bg-[#0a0a0b] border border-white/[0.08]">
-                    <div className="text-[11px] text-zinc-500">Raw HTML</div>
+                    <div className="text-[11px] text-zinc-500">AX Tree Size</div>
                     <div className="text-sm font-mono tabular-nums font-medium text-zinc-100 mt-1">
-                      {(realBrowserState?.rawHtmlLength || 0).toLocaleString()} B
-                    </div>
-                  </div>
-                  <div className="p-3 rounded-lg bg-[#0a0a0b] border border-white/[0.08]">
-                    <div className="text-[11px] text-zinc-500">Stripped Payload</div>
-                    <div className="text-sm font-mono tabular-nums font-medium text-zinc-100 mt-1">
-                      {(realBrowserState?.cleanedHtmlLength || 0).toLocaleString()} B
+                      {(realBrowserState?.accessibilityTree?.length || 0).toLocaleString()} chars
                     </div>
                   </div>
                   <div className="p-3 rounded-lg bg-[#0a0a0b] border border-white/[0.08]">
@@ -466,12 +460,18 @@ export const ChromiumBrowser: React.FC<Props> = ({
                       {realBrowserState?.elementCount || 0}
                     </div>
                   </div>
+                  <div className="p-3 rounded-lg bg-[#0a0a0b] border border-white/[0.08]">
+                    <div className="text-[11px] text-zinc-500">Focused Node</div>
+                    <div className="text-sm font-mono font-medium text-zinc-100 mt-1 truncate">
+                      {realBrowserState?.focusedElement?.tagName || 'none'}
+                    </div>
+                  </div>
                 </div>
               )}
 
               {devTab === 'dom' && (
-                <pre className="font-mono text-[11px] text-zinc-300 whitespace-pre-wrap leading-relaxed select-all">
-                  {realBrowserState?.cleanedHtml || 'No DOM content available.'}
+                <pre className="font-mono text-[11px] text-zinc-300 whitespace-pre-wrap leading-relaxed select-text">
+                  {realBrowserState?.accessibilityTree || 'No accessibility tree available.'}
                 </pre>
               )}
 

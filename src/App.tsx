@@ -446,7 +446,7 @@ export default function App() {
             onStopTask={handleStopTask}
             onPauseTask={handlePauseTask}
             onResumeTask={handleResumeTask}
-            currentDomTokens={realBrowserState?.cleanedHtmlLength || 0}
+            currentDomTokens={realBrowserState?.accessibilityTree?.length || 0}
             className="w-full h-full border-none"
           />
         </div>
@@ -582,7 +582,7 @@ export default function App() {
           onStopTask={handleStopTask}
           onPauseTask={handlePauseTask}
           onResumeTask={handleResumeTask}
-          currentDomTokens={realBrowserState?.cleanedHtmlLength || 0}
+          currentDomTokens={realBrowserState?.accessibilityTree?.length || 0}
         />
       </div>
 

@@ -22,7 +22,30 @@ Models currently used:
 
 ## Getting Started
 
-### 1. Install Dependencies
+### Option A: Run with Docker (Recommended)
+
+Avoid host Node/Chromium dependency conflicts by running everything inside Docker (Node 22 + Patchright Chromium + all Linux browser libraries included):
+
+1. Set your Gemini API key (either in `.env` or exported in your shell):
+
+```bash
+cp .env.example .env
+# Edit .env and set GEMINI_API_KEY="your_gemini_api_key_here"
+```
+
+2. Build and start the container:
+
+```bash
+docker compose up --build
+```
+
+3. Open `http://localhost:3000` in your browser.
+
+---
+
+### Option B: Run Manually with Node.js
+
+#### 1. Install Dependencies
 
 Make sure you have **Node.js 20+** and **npm** installed, then install packages (this also installs Patchright's Chromium binary via the `postinstall` script):
 
@@ -30,7 +53,9 @@ Make sure you have **Node.js 20+** and **npm** installed, then install packages 
 npm install
 ```
 
-### 2. Insert Your Gemini API Key
+*(On Linux, you may also need OS Chromium libraries: `npx patchright install-deps chromium`.)*
+
+#### 2. Insert Your Gemini API Key
 
 Copy `.env.example` to `.env` in the project root and add your Gemini API key:
 
@@ -40,7 +65,7 @@ GEMINI_API_KEY="your_gemini_api_key_here"
 
 *(In AI Studio hosted environments, set `GEMINI_API_KEY` in the **Secrets** panel instead of committing `.env`.)*
 
-### 3. Run the Application
+#### 3. Run the Application
 
 Start the development server (Express API + Vite frontend on port `3000`):
 
@@ -56,6 +81,18 @@ npm run start
 ```
 
 Open `http://localhost:3000` in your browser. Type any task into the right-hand chat panel (for example, comparing product prices or researching a topic on Wikipedia), or click directly inside the browser viewport at any time to take manual control.
+
+### Optional: Residential Proxy on antiX / Linux (`gost` + `bore`)
+
+To route Cloud Chromium through your local machine's residential IP:
+
+1. Start an authenticated HTTP proxy with `gost` and expose it via `bore`:
+   ```bash
+   gost -L "http://myuser:mypass@127.0.0.1:8080" &
+   bore local 8080 --to bore.pub
+   ```
+   *(Use `http://` rather than `socks5://` so Chromium supports username/password authentication.)*
+2. Click **Proxy** in the top bar, enter `http://bore.pub:<port>` with your username and password, and toggle **Enable Proxy** ON.
 
 ### Optional: Connecting Your Local Firefox Browser
 
