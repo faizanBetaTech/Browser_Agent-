@@ -65,6 +65,8 @@ class ChromiumManager {
     username: '',
     password: '',
   };
+  private activeTimezoneId: string = '';
+  private resolvedTimezoneCache: Map<string, string> = new Map();
 
   public async init(): Promise<void> {
     if (this.browser && this.context) return;
@@ -77,21 +79,18 @@ class ChromiumManager {
 
     this.isInitializing = true;
     try {
-      console.log('[Patchright Engine] Launching native anti-fingerprint hardened Chromium engine...');
-      const launchOptions = {
+      console.log('[Patchright Engine] Launching native Patchright Chromium engine...');
+      const launchOptions: any = {
+        channel: 'chromium',
         headless: true,
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
           '--disable-dev-shm-usage',
           '--no-first-run',
-          '--disable-gpu',
-          '--window-size=1280,800',
-          '--start-maximized',
-          '--disable-blink-features=AutomationControlled',
-          '--disable-features=IsolateOrigins,site-per-process',
-          '--disable-infobars',
           '--no-default-browser-check',
+          '--window-size=1280,800',
+          '--disable-infobars',
           '--lang=en-US,en',
         ],
         ignoreDefaultArgs: ['--enable-automation'],
@@ -116,16 +115,47 @@ class ChromiumManager {
         }
       }
 
+      const proxyKey = this.proxyConfig.enabled && this.proxyConfig.server.trim()
+        ? this.proxyConfig.server.trim()
+        : 'direct';
+
+      let resolvedTimezone = this.resolvedTimezoneCache.get(proxyKey);
+      if (!resolvedTimezone && proxyKey === 'direct') {
+        try {
+          const geoRes = await fetch('http://ip-api.com/json?fields=status,timezone', {
+            signal: AbortSignal.timeout(1800),
+          });
+          if (geoRes.ok) {
+            const geo: any = await geoRes.json();
+            const tz = typeof geo?.timezone === 'string' ? geo.timezone.trim() : '';
+            if (geo?.status === 'success' && tz) {
+              resolvedTimezone = tz;
+              this.resolvedTimezoneCache.set('direct', tz);
+            }
+          }
+        } catch {}
+      }
+
+      const fallbackTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+      this.activeTimezoneId = resolvedTimezone || fallbackTimezone;
+
+      const majorVersion = (this.browser?.version() || '136.0.0.0').split('.')[0];
+      const osPlatformToken =
+        process.platform === 'darwin'
+          ? 'Macintosh; Intel Mac OS X 10_15_7'
+          : process.platform === 'win32'
+            ? 'Windows NT 10.0; Win64; x64'
+            : 'X11; Linux x86_64';
+
+      // Match real host OS, real Chromium major version, native Sec-CH-UA headers, and native GPU cleanly
       const contextOptions: any = {
         viewport: { width: 1280, height: 800 },
-        userAgent:
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+        userAgent: `Mozilla/5.0 (${osPlatformToken}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${majorVersion}.0.0.0 Safari/537.36`,
         locale: 'en-US',
-        timezoneId: 'America/New_York',
+        timezoneId: this.activeTimezoneId,
         deviceScaleFactor: 1,
         hasTouch: false,
         isMobile: false,
-        permissions: ['geolocation', 'notifications'],
       };
 
       if (this.proxyConfig.enabled && this.proxyConfig.server.trim()) {
@@ -152,181 +182,7 @@ class ChromiumManager {
       }
 
       this.context = await this.browser.newContext(contextOptions);
-
-      // Comprehensive stealth script: bypasses Google "This browser or app may not be secure" / dangerous environment check
-      await this.context.addInitScript(() => {
-        // 1. Remove navigator.webdriver & automation flags
-        try {
-          Object.defineProperty(navigator, 'webdriver', {
-            get: () => undefined,
-            configurable: true,
-          });
-          const proto = Object.getPrototypeOf(navigator);
-          if (proto && 'webdriver' in proto) {
-            delete (proto as any).webdriver;
-          }
-        } catch (_) {}
-
-        // 2. Mock complete window.chrome and chrome.runtime (checked by Google BotGuard)
-        try {
-          if (!(window as any).chrome) {
-            (window as any).chrome = {};
-          }
-          const ch = (window as any).chrome;
-          ch.app = {
-            isInstalled: false,
-            InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
-            RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' },
-          };
-          ch.runtime = {
-            OnInstalledReason: { INSTALL: 'install', UPDATE: 'update', CHROME_UPDATE: 'chrome_update', SHARED_MODULE_UPDATE: 'shared_module_update' },
-            OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
-            PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
-            PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
-            PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
-            RequestUpdateCheckStatus: { THROTTLED: 'throttled', NO_UPDATE: 'no_update', UPDATE_AVAILABLE: 'update_available' },
-            connect: function () {},
-            sendMessage: function () {},
-          };
-          ch.loadTimes = function () {
-            return {
-              commitLoadTime: Date.now() / 1000 - 0.4,
-              connectionInfo: 'h2',
-              finishDocumentLoadTime: Date.now() / 1000 - 0.1,
-              finishLoadTime: Date.now() / 1000,
-              firstPaintAfterLoadTime: 0,
-              firstPaintTime: Date.now() / 1000 - 0.2,
-              navigationType: 'Other',
-              npnNegotiatedProtocol: 'h2',
-              requestTime: Date.now() / 1000 - 0.6,
-              startLoadTime: Date.now() / 1000 - 0.5,
-              wasAlternateProtocolAvailable: false,
-              wasFetchedViaSpdy: true,
-              wasNpnNegotiated: true,
-            };
-          };
-          ch.csi = function () {
-            return {
-              startE: Date.now() - 400,
-              onloadT: Date.now(),
-              pageT: 400,
-              tran: 15,
-            };
-          };
-        } catch (_) {}
-
-        // 3. UserAgentData Client Hints (Crucial for Google Accounts login on Chrome)
-        try {
-          Object.defineProperty(navigator, 'userAgentData', {
-            get: () => ({
-              brands: [
-                { brand: 'Chromium', version: '130' },
-                { brand: 'Google Chrome', version: '130' },
-                { brand: 'Not?A_Brand', version: '99' },
-              ],
-              mobile: false,
-              platform: 'Windows',
-              getHighEntropyValues: async () => ({
-                architecture: 'x86',
-                bitness: '64',
-                brands: [
-                  { brand: 'Chromium', version: '130' },
-                  { brand: 'Google Chrome', version: '130' },
-                  { brand: 'Not?A_Brand', version: '99' },
-                ],
-                fullVersionList: [
-                  { brand: 'Chromium', version: '130.0.6723.116' },
-                  { brand: 'Google Chrome', version: '130.0.6723.116' },
-                  { brand: 'Not?A_Brand', version: '99.0.0.0' },
-                ],
-                mobile: false,
-                model: '',
-                platform: 'Windows',
-                platformVersion: '15.0.0',
-              }),
-            }),
-            configurable: true,
-          });
-        } catch (_) {}
-
-        // 4. Realistic Plugins and MimeTypes array
-        try {
-          if (navigator.plugins.length === 0) {
-            const pluginData = [
-              { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-              { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-              { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-              { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-              { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-            ];
-            const plugins = Object.create(PluginArray.prototype);
-            pluginData.forEach((p, idx) => {
-              const plugin = Object.create(Plugin.prototype);
-              Object.defineProperties(plugin, {
-                name: { value: p.name, enumerable: true },
-                filename: { value: p.filename, enumerable: true },
-                description: { value: p.description, enumerable: true },
-                length: { value: 0, enumerable: true },
-              });
-              plugins[idx] = plugin;
-              plugins[p.name] = plugin;
-            });
-            Object.defineProperty(plugins, 'length', { value: pluginData.length });
-            Object.defineProperty(navigator, 'plugins', { get: () => plugins, configurable: true });
-          }
-        } catch (_) {}
-
-        // 5. Languages & Hardware Specs
-        try {
-          Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'], configurable: true });
-          Object.defineProperty(navigator, 'deviceMemory', { get: () => 8, configurable: true });
-          Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8, configurable: true });
-        } catch (_) {}
-
-        // 6. Window Outer Dimensions & Screen Depth
-        try {
-          Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth || 1280, configurable: true });
-          Object.defineProperty(window, 'outerHeight', { get: () => (window.innerHeight || 800) + 85, configurable: true });
-          if (window.screen) {
-            Object.defineProperty(screen, 'colorDepth', { get: () => 24, configurable: true });
-            Object.defineProperty(screen, 'pixelDepth', { get: () => 24, configurable: true });
-          }
-        } catch (_) {}
-
-        // 7. WebGL Vendor & Renderer spoofing (Blocks BotGuard virtual machine detection)
-        try {
-          const getParameter = WebGLRenderingContext.prototype.getParameter;
-          WebGLRenderingContext.prototype.getParameter = function (parameter: number) {
-            if (parameter === 37445) return 'Google Inc. (NVIDIA)';
-            if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3080 Direct3D11 vs_5_0 ps_5_0, D3D11)';
-            return getParameter.apply(this, [parameter]);
-          };
-          if (window.WebGL2RenderingContext) {
-            const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
-            WebGL2RenderingContext.prototype.getParameter = function (parameter: number) {
-              if (parameter === 37445) return 'Google Inc. (NVIDIA)';
-              if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3080 Direct3D11 vs_5_0 ps_5_0, D3D11)';
-              return getParameter2.apply(this, [parameter]);
-            };
-          }
-        } catch (_) {}
-
-        // 8. Notification Permissions query
-        try {
-          if (navigator.permissions && navigator.permissions.query) {
-            const origQuery = navigator.permissions.query.bind(navigator.permissions);
-            navigator.permissions.query = (parameters: any) => {
-              if (parameters && parameters.name === 'notifications') {
-                return Promise.resolve({
-                  state: Notification.permission || 'default',
-                  onchange: null,
-                } as any);
-              }
-              return origQuery(parameters);
-            };
-          }
-        } catch (_) {}
-      });
+      console.log(`[Patchright Engine] Context created cleanly (timezone: ${this.activeTimezoneId}, native UA/GPU/headers).`);
 
       // Automatically detect any popups or new tabs (e.g. window.open)
       this.context.on('page', (newPage: Page) => {
@@ -1528,27 +1384,46 @@ class ChromiumManager {
       }
     } catch {}
 
-    // Re-create context with new proxy configuration
-    if (this.context) {
-      try {
-        await this.context.close();
-      } catch (_) {}
-      this.context = null;
-      this.pages.clear();
-      this.activePageId = 'tab-1';
-      this.tabCounter = 0;
+    const recreateContext = async (targetUrl: string) => {
+      if (this.context) {
+        try {
+          await this.context.close();
+        } catch (_) {}
+        this.context = null;
+        this.pages.clear();
+        this.activePageId = 'tab-1';
+        this.tabCounter = 0;
+      }
       await this.init();
-      if (previousUrl && previousUrl.startsWith('http') && !previousUrl.includes('www.google.com')) {
+      if (targetUrl && targetUrl.startsWith('http') && !targetUrl.includes('www.google.com')) {
         const active = await this.getActivePage().catch(() => null);
         if (active) {
-          await active.goto(previousUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+          await active.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
         }
       }
+    };
+
+    // Re-create context with new proxy configuration
+    if (this.context) {
+      await recreateContext(previousUrl);
+    } else {
+      await this.init();
     }
 
-    // Check egress IP through the active browser
+    // Check egress IP through the active browser and sync timezoneId if needed
     try {
       const ipInfo = await this.checkEgressIp();
+      const detectedTz = typeof ipInfo?.timezone === 'string' ? ipInfo.timezone.trim() : '';
+      if (detectedTz) {
+        const cacheKey = this.proxyConfig.enabled && this.proxyConfig.server
+          ? this.proxyConfig.server
+          : 'direct';
+        this.resolvedTimezoneCache.set(cacheKey, detectedTz);
+        if (detectedTz !== this.activeTimezoneId) {
+          console.log(`[Patchright Engine] Syncing browser timezone to egress IP: ${this.activeTimezoneId} -> ${detectedTz}`);
+          await recreateContext(previousUrl);
+        }
+      }
       return { success: true, ipInfo };
     } catch (err: any) {
       return { success: true, error: err.message };

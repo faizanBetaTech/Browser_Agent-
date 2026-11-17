@@ -82,17 +82,20 @@ npm run start
 
 Open `http://localhost:3000` in your browser. Type any task into the right-hand chat panel (for example, comparing product prices or researching a topic on Wikipedia), or click directly inside the browser viewport at any time to take manual control.
 
-### Optional: Residential Proxy on antiX / Linux (`gost` + `bore`)
+### Optional: Residential Proxy on antiX / Linux (`gost` + `Pinggy` / `bore`)
 
 To route Cloud Chromium through your local machine's residential IP:
 
-1. Start an authenticated HTTP proxy with `gost` and expose it via `bore`:
+1. Start an authenticated HTTP proxy with `gost` (keep `http://`, as Chromium does not support username/password auth on `socks5://`):
    ```bash
-   gost -L "http://myuser:mypass@127.0.0.1:8080" &
-   bore local 8080 --to bore.pub
+   gost -L "http://myuser:mypass@127.0.0.1:8080"
    ```
-   *(Use `http://` rather than `socks5://` so Chromium supports username/password authentication.)*
-2. Click **Proxy** in the top bar, enter `http://bore.pub:<port>` with your username and password, and toggle **Enable Proxy** ON.
+2. Expose port `8080` over HTTPS port `443` using built-in `ssh` + Pinggy (avoids ISP/relay timeouts on port `7835`):
+   ```bash
+   ssh -p 443 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -R 0:127.0.0.1:8080 tcp@a.pinggy.io
+   ```
+   *(Or use `bore local 8080 --to bore.pub` if port `7835` is open on your network.)*
+3. Copy the assigned host/port (replacing `tcp://` with `http://`, e.g. `http://xxxxx.a.pinggy.link:12345`), open **Proxy** in the top bar, enter your server URL + username/password, toggle **Enable Proxy** ON, and click **Check IP**.
 
 ### Optional: Connecting Your Local Firefox Browser
 
@@ -137,6 +140,25 @@ To route Cloud Chromium through your local machine's residential IP:
 - **`extensionManager.ts` & `firefox-extension/`**: Long-polling command queue and content-script bridge allowing the same agent loop to inspect and automate tabs in desktop Firefox.
 - **`decisionGate.ts`**: Experimental System-1 decision gatekeeper powered by `gemini-decision-1`.
 - **`src/`**: Minimalist monochrome web workspace with a live interactive browser canvas, chat task controller, and collapsible Model Payload Inspector.
+
+---
+
+## Anti-Bot Checks, Proxy Routing & Fingerprinting
+
+Strict login and anti-bot systems (such as Google BotGuard) look far beyond IP addresses—they cross-check HTTP headers, JavaScript APIs, WebGL/GPU rendering, native function prototypes, and IP-to-timezone consistency. Here is how this project handles all three layers in `chromiumManager.ts`:
+
+### 1. Native Patchright Stealth & Full Chromium (`channel: 'chromium'`)
+- **No brittle JS `addInitScript` spoofs:** Patchright patches C++/CDP automation leaks (`navigator.webdriver = false`, `Runtime.enable` isolation) directly inside the engine. Removing legacy Puppeteer-style `addInitScript` overrides prevents `[native code]` prototype integrity failures (`Function.prototype.toString()` checks).
+- **Full Chromium binary instead of `chrome-headless-shell`:** Launching with `channel: 'chromium'` ensures `window.chrome` exists natively and removes `"HeadlessChrome"` from `Sec-CH-UA` client-hint headers.
+- **OS, Version & GPU Consistency:** Rather than faking Windows / Chrome 130 / NVIDIA RTX 3080 Direct3D11 on a Linux container (which contradicts `navigator.platform`, real `Sec-CH-UA` headers, and SwiftShader), `User-Agent` is dynamically derived from `process.platform` and `browser.version()`, site isolation (`IsolateOrigins`, `site-per-process`) stays intact, and Linux SwiftShader WebGL reports consistently with the host OS.
+
+### 2. Dynamic Egress-IP Timezone Syncing
+- Hardcoded timezones (like `America/New_York`) immediately fail geo-consistency checks when traffic exits from another region.
+- `chromiumManager.ts` queries the active egress IP's timezone (`ip-api.com`) on startup and automatically whenever proxy settings are applied or toggled, caching per proxy and recreating the browser context so `Intl.DateTimeFormat().resolvedOptions().timeZone` always matches the active exit IP.
+
+### 3. Toggleable Residential Proxy Tunneling (`gost` + Pinggy / `bore`)
+- Cloud Run / datacenter IPs are frequently flagged even with a clean fingerprint. Built-in proxy controls (`/api/proxy/*`, disabled by default) let you toggle residential egress routing on demand.
+- Because Chromium only supports proxy username/password authentication over `http://` (not `socks5://`), local egress runs through `gost -L "http://user:pass@127.0.0.1:8080"` and tunnels cleanly out over SSH port `443` via Pinggy (avoiding per-connection port-`7835` timeouts seen with `bore.pub`)—or runs directly on your machine with no tunnel via `docker compose up --build`.
 
 ---
 
